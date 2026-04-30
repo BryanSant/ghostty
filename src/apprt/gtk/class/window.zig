@@ -32,6 +32,9 @@ const WeakRef = @import("../weak_ref.zig").WeakRef;
 
 const log = std.log.scoped(.gtk_ghostty_window);
 
+/// Monotonically incrementing counter for unique per-window CSS class names.
+var window_id_counter: std.atomic.Value(u32) = .init(0);
+
 pub const Window = extern struct {
     const Self = @This();
     parent_instance: Parent,
@@ -231,6 +234,11 @@ pub const Window = extern struct {
         /// The configuration that this surface is using.
         config: ?*Config = null,
 
+        /// CSS provider for this window's scoped header bar color.
+        css_provider: *gtk.CssProvider = undefined,
+        /// Null-terminated CSS class name, e.g. "ghostty-window-3".
+        css_class: [32:0]u8 = undefined,
+
         /// State and logic for windowing protocol for a window.
         winproto: winprotopkg.Window,
 
@@ -307,6 +315,23 @@ pub const Window = extern struct {
         // We initialize our windowing protocol to none because we can't
         // actually initialize this until we get realized.
         priv.winproto = .none;
+
+        // Assign a unique CSS class for per-window header bar scoping.
+        const window_id = window_id_counter.fetchAdd(1, .monotonic);
+        _ = std.fmt.bufPrintZ(&priv.css_class, "ghostty-window-{d}", .{window_id})
+            catch unreachable; // buffer is always large enough
+        self.as(gtk.Widget).addCssClass(&priv.css_class);
+
+        // Create and register a per-window CSS provider at a priority above the
+        // application-wide provider (APPLICATION+3) so per-window rules win.
+        priv.css_provider = gtk.CssProvider.new();
+        if (gdk.Display.getDefault()) |display| {
+            gtk.StyleContext.addProviderForDisplay(
+                display,
+                priv.css_provider.as(gtk.StyleProvider),
+                gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 4,
+            );
+        }
 
         // Add our dev CSS class if we're in debug mode.
         if (comptime build_config.is_debug) {
@@ -704,6 +729,98 @@ pub const Window = extern struct {
         priv.winproto.syncAppearance() catch |err| {
             log.warn("failed to sync winproto appearance error={}", .{err});
         };
+
+        self.updateHeaderbarCss();
+    }
+
+    /// Regenerate and load the per-window header bar CSS into the window's
+    /// scoped CSS provider. Matching the header bar color to the active
+    /// surface's terminal background makes the header and terminal feel
+    /// seamless — as if the title bar is a natural extension of the terminal.
+    /// Safe to call multiple times; each call replaces the previously loaded
+    /// CSS. Only emits CSS when window-theme is ghostty.
+    pub fn updateHeaderbarCss(self: *Self) void {
+        const priv = self.private();
+        const config = if (priv.config) |c| c.get() else return;
+
+        // Only color the header bar under the ghostty window theme.
+        if (config.@"window-theme" != .ghostty) return;
+
+        // Color resolution priority:
+        //   1. window-titlebar-background config (explicit user override)
+        //   2. Active surface's live OSC color (headerbar_bg from OSC 11)
+        //   3. config.background (fallback)
+        const bg: configpkg.Config.Color = blk: {
+            if (config.@"window-titlebar-background") |c| break :blk c;
+            if (self.getActiveSurface()) |s| {
+                if (s.getHeaderbarBg()) |c| break :blk c;
+            }
+            break :blk config.background;
+        };
+        const fg: configpkg.Config.Color = blk: {
+            if (config.@"window-titlebar-foreground") |c| break :blk c;
+            if (self.getActiveSurface()) |s| {
+                if (s.getHeaderbarFg()) |c| break :blk c;
+            }
+            break :blk config.foreground;
+        };
+
+        const alloc = Application.default().allocator();
+        var buf: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(
+            alloc,
+            512,
+        ) catch return;
+        defer buf.deinit();
+        const writer = &buf.writer;
+
+        if (gtk_version.runtimeAtLeast(4, 16, 0)) {
+            // GTK 4.16+: set CSS custom properties scoped to this window.
+            // The global provider keeps `windowhandle { background-color: var(...) }`
+            // so we only need to define the variable values here.
+            writer.print(
+                \\window.{s} {{
+                \\  --ghostty-fg: rgb({d},{d},{d});
+                \\  --ghostty-bg: rgb({d},{d},{d});
+                \\  --headerbar-fg-color: var(--ghostty-fg);
+                \\  --headerbar-bg-color: var(--ghostty-bg);
+                \\  --headerbar-backdrop-color: oklab(from var(--ghostty-bg) calc(l * 0.9) a b / alpha);
+                \\  --overview-fg-color: var(--ghostty-fg);
+                \\  --overview-bg-color: var(--ghostty-bg);
+                \\  --popover-fg-color: var(--ghostty-fg);
+                \\  --popover-bg-color: var(--ghostty-bg);
+                \\  --window-fg-color: var(--ghostty-fg);
+                \\  --window-bg-color: var(--ghostty-bg);
+                \\}}
+                \\
+            , .{
+                @as([*:0]const u8, &priv.css_class),
+                fg.r, fg.g, fg.b,
+                bg.r, bg.g, bg.b,
+            }) catch return;
+        } else {
+            // GTK < 4.16: emit direct color values on windowhandle scoped to this window.
+            writer.print(
+                \\window.{s} windowhandle {{
+                \\  background-color: rgb({d},{d},{d});
+                \\  color: rgb({d},{d},{d});
+                \\}}
+                \\window.{s} windowhandle:backdrop {{
+                \\  background-color: oklab(from rgb({d},{d},{d}) calc(l * 0.9) a b / alpha);
+                \\}}
+                \\
+            , .{
+                @as([*:0]const u8, &priv.css_class),
+                bg.r, bg.g, bg.b,
+                fg.r, fg.g, fg.b,
+                @as([*:0]const u8, &priv.css_class),
+                bg.r, bg.g, bg.b,
+            }) catch return;
+        }
+
+        const written = buf.written();
+        const bytes = glib.Bytes.new(written.ptr, written.len);
+        defer bytes.unref();
+        priv.css_provider.loadFromBytes(bytes);
     }
 
     /// Sync the state of any actions on this window.
@@ -1224,6 +1341,15 @@ pub const Window = extern struct {
 
         priv.tab_bindings.setSource(null);
 
+        // Remove and release the per-window CSS provider.
+        if (gdk.Display.getDefault()) |display| {
+            gtk.StyleContext.removeProviderForDisplay(
+                display,
+                priv.css_provider.as(gtk.StyleProvider),
+            );
+        }
+        priv.css_provider.unref();
+
         gtk.Widget.disposeTemplate(
             self.as(gtk.Widget),
             getGObjectType(),
@@ -1468,6 +1594,9 @@ pub const Window = extern struct {
         // If the tab was previously marked as needing attention
         // (e.g. due to a bell character), we now unmark that
         page.setNeedsAttention(@intFromBool(false));
+
+        // Update header bar color to match the newly active surface's background.
+        self.updateHeaderbarCss();
     }
 
     fn tabViewPageAttached(

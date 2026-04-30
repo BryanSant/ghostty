@@ -769,6 +769,7 @@ pub const Application = extern struct {
             .end_search => Action.endSearch(target),
             .search_total => Action.searchTotal(target, value),
             .search_selected => Action.searchSelected(target, value),
+            .color_change => return Action.colorChange(target, value),
 
             // Unimplemented
             .secure_input,
@@ -779,7 +780,6 @@ pub const Application = extern struct {
             .cell_size,
             .render_inspector,
             .renderer_health,
-            .color_change,
             .reset_window_size,
             .check_for_updates,
             .undo,
@@ -926,38 +926,13 @@ pub const Application = extern struct {
 
     /// Load runtime CSS for older than GTK 4.16
     fn loadRuntimeCss414(
-        config: *const CoreConfig,
-        writer: *std.Io.Writer,
+        _: *const CoreConfig,
+        _: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
+        // windowhandle CSS for GTK < 4.16 is now handled per-window by
+        // Window.updateHeaderbarCss() so that each window can track its own
+        // active surface's live terminal background color.
         if (gtk_version.runtimeAtLeast(4, 16, 0)) return;
-
-        const window_theme = config.@"window-theme";
-        const headerbar_background = config.@"window-titlebar-background" orelse config.background;
-        const headerbar_foreground = config.@"window-titlebar-foreground" orelse config.foreground;
-
-        switch (window_theme) {
-            .ghostty => try writer.print(
-                \\windowhandle {{
-                \\  background-color: rgb({d},{d},{d});
-                \\  color: rgb({d},{d},{d});
-                \\}}
-                \\windowhandle:backdrop {{
-                \\ background-color: oklab(from rgb({d},{d},{d}) calc(l * 0.9) a b / alpha);
-                \\}}
-                \\
-            , .{
-                headerbar_background.r,
-                headerbar_background.g,
-                headerbar_background.b,
-                headerbar_foreground.r,
-                headerbar_foreground.g,
-                headerbar_foreground.b,
-                headerbar_background.r,
-                headerbar_background.g,
-                headerbar_background.b,
-            }),
-            else => {},
-        }
     }
 
     /// Load runtime for GTK 4.16 and newer
@@ -968,8 +943,6 @@ pub const Application = extern struct {
         if (gtk_version.runtimeUntil(4, 16, 0)) return;
 
         const window_theme = config.@"window-theme";
-        const headerbar_background = config.@"window-titlebar-background" orelse config.background;
-        const headerbar_foreground = config.@"window-titlebar-foreground" orelse config.foreground;
 
         try writer.writeAll(
             \\/*
@@ -1026,36 +999,21 @@ pub const Application = extern struct {
             \\
         );
 
+        // The CSS variables (--ghostty-fg/bg, --headerbar-*) are now set per-window
+        // by Window.updateHeaderbarCss() so that each window tracks its own active
+        // surface's live terminal background color. Only the structural rules that
+        // consume those variables remain here.
         switch (window_theme) {
-            .ghostty => try writer.print(
-                \\:root {{
-                \\  --ghostty-fg: rgb({d},{d},{d});
-                \\  --ghostty-bg: rgb({d},{d},{d});
-                \\  --headerbar-fg-color: var(--ghostty-fg);
-                \\  --headerbar-bg-color: var(--ghostty-bg);
-                \\  --headerbar-backdrop-color: oklab(from var(--headerbar-bg-color) calc(l * 0.9) a b / alpha);
-                \\  --overview-fg-color: var(--ghostty-fg);
-                \\  --overview-bg-color: var(--ghostty-bg);
-                \\  --popover-fg-color: var(--ghostty-fg);
-                \\  --popover-bg-color: var(--ghostty-bg);
-                \\  --window-fg-color: var(--ghostty-fg);
-                \\  --window-bg-color: var(--ghostty-bg);
-                \\}}
-                \\windowhandle {{
+            .ghostty => try writer.writeAll(
+                \\windowhandle {
                 \\  background-color: var(--headerbar-bg-color);
                 \\  color: var(--headerbar-fg-color);
-                \\}}
-                \\windowhandle:backdrop {{
-                \\ background-color: var(--headerbar-backdrop-color);
-                \\}}
-            , .{
-                headerbar_foreground.r,
-                headerbar_foreground.g,
-                headerbar_foreground.b,
-                headerbar_background.r,
-                headerbar_background.g,
-                headerbar_background.b,
-            }),
+                \\}
+                \\windowhandle:backdrop {
+                \\  background-color: var(--headerbar-backdrop-color);
+                \\}
+                \\
+            ),
             else => {},
         }
     }
@@ -2553,6 +2511,38 @@ const Action = struct {
         switch (target) {
             .app => {},
             .surface => |v| v.rt_surface.surface.setSearchSelected(value.selected),
+        }
+    }
+
+    pub fn colorChange(
+        target: apprt.Target,
+        value: apprt.action.ColorChange,
+    ) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+
+                // Store the live color on the surface for retrieval by the
+                // window when generating per-window header bar CSS.
+                switch (value.kind) {
+                    .background => surface.setHeaderbarBg(value.r, value.g, value.b),
+                    .foreground => surface.setHeaderbarFg(value.r, value.g, value.b),
+                    // Palette index and cursor changes don't affect the header bar.
+                    else => return false,
+                }
+
+                // Find the parent window and re-render its header bar CSS.
+                const window = ext.getAncestor(
+                    Window,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a window, ignoring color_change", .{});
+                    return false;
+                };
+                window.updateHeaderbarCss();
+                return true;
+            },
         }
     }
 

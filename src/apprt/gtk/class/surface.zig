@@ -644,6 +644,11 @@ pub const Surface = extern struct {
         /// True when the child has exited.
         child_exited: bool = false,
 
+        /// Live header bar background color from OSC 11. Null means use config.
+        headerbar_bg: ?configpkg.Config.Color = null,
+        /// Live header bar foreground color from OSC 10. Null means use config.
+        headerbar_fg: ?configpkg.Config.Color = null,
+
         // Progress bar
         progress_bar_timer: ?c_uint = null,
 
@@ -2164,6 +2169,22 @@ pub const Surface = extern struct {
 
     pub fn getBellRinging(self: *Self) bool {
         return self.private().bell_ringing;
+    }
+
+    pub fn setHeaderbarBg(self: *Self, r: u8, g: u8, b: u8) void {
+        self.private().headerbar_bg = .{ .r = r, .g = g, .b = b };
+    }
+
+    pub fn setHeaderbarFg(self: *Self, r: u8, g: u8, b: u8) void {
+        self.private().headerbar_fg = .{ .r = r, .g = g, .b = b };
+    }
+
+    pub fn getHeaderbarBg(self: *Self) ?configpkg.Config.Color {
+        return self.private().headerbar_bg;
+    }
+
+    pub fn getHeaderbarFg(self: *Self) ?configpkg.Config.Color {
+        return self.private().headerbar_fg;
     }
 
     pub fn setBellRinging(self: *Self, ringing: bool) void {
