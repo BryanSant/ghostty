@@ -944,6 +944,9 @@ pub const Application = extern struct {
                 \\windowhandle:backdrop {{
                 \\ background-color: oklab(from rgb({d},{d},{d}) calc(l * 0.9) a b / alpha);
                 \\}}
+                \\headerbar, .top-bar, .bottom-bar {{
+                \\  box-shadow: none;
+                \\}}
                 \\
             , .{
                 headerbar_background.r,
@@ -1047,6 +1050,9 @@ pub const Application = extern struct {
                 \\}}
                 \\windowhandle:backdrop {{
                 \\ background-color: var(--headerbar-backdrop-color);
+                \\}}
+                \\headerbar, .top-bar, .bottom-bar {{
+                \\  box-shadow: none;
                 \\}}
             , .{
                 headerbar_foreground.r,
